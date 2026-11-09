@@ -49,8 +49,8 @@ import { removePhotoBackground } from "@/lib/backgroundRemover";
 
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
-const MAX_NAME_LENGTH = 40;
-const MAX_LOCATION_LENGTH = 42;
+const MAX_NAME_LENGTH = 45;
+const MAX_LOCATION_LENGTH = 45;
 
 export default function HarvestPosterApp() {
   // Master flyer image loaded once in browser memory
@@ -290,10 +290,10 @@ export default function HarvestPosterApp() {
     }
   };
 
-  // 4. Handle Name & Location/Parish inputs
+  // 4. Handle Name & Location/Parish inputs (allows letters, numbers, spaces, and special characters)
   const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.value;
-    const sanitized = raw.replace(/[^\p{L}\p{M}\s.'-]/gu, "").slice(0, MAX_NAME_LENGTH);
+    const sanitized = raw.replace(/[\r\n\t]+/g, " ").slice(0, MAX_NAME_LENGTH);
     setVisitorName(sanitized);
     if (sanitized.trim().length > 0) {
       setFormError(null);
@@ -304,10 +304,7 @@ export default function HarvestPosterApp() {
 
   const handleLocationChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.value;
-    // Allow letters, numbers, spaces, commas, dots, hyphens, apostrophes, and parentheses
-    const sanitized = raw
-      .replace(/[^\p{L}\p{M}\p{N}\s.,'()-]/gu, "")
-      .slice(0, MAX_LOCATION_LENGTH);
+    const sanitized = raw.replace(/[\r\n\t]+/g, " ").slice(0, MAX_LOCATION_LENGTH);
     setVisitorLocation(sanitized);
     setGeneratedPngUrl(null);
     setGeneratedBlob(null);
