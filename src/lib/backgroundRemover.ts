@@ -4,13 +4,8 @@
  * with an automatic canvas flood-matting fallback if WebGL/WASM is unavailable on a device.
  */
 
-// Global singleton so we only initialize the WASM/TFLite model once per session
 let segmentationInstancePromise: Promise<any> | null = null;
 
-/**
- * Dynamically loads the MediaPipe SelfieSegmentation script from /mediapipe/selfie_segmentation.js
- * and initializes the local WASM/TFLite model.
- */
 async function getSelfieSegmentationInstance(): Promise<any> {
   if (segmentationInstancePromise) {
     return segmentationInstancePromise;
@@ -25,7 +20,6 @@ async function getSelfieSegmentationInstance(): Promise<any> {
 
       const win = window as any;
 
-      // Load the local script tag if SelfieSegmentation is not yet on window
       if (!win.SelfieSegmentation) {
         await new Promise<void>((scriptResolve, scriptReject) => {
           const existingScript = document.querySelector(
@@ -55,7 +49,7 @@ async function getSelfieSegmentationInstance(): Promise<any> {
       });
 
       segmenter.setOptions({
-        modelSelection: 1, // 1 = general/landscape portrait model (high accuracy for head & torso)
+        modelSelection: 1,
       });
 
       await segmenter.initialize();
@@ -73,20 +67,19 @@ async function getSelfieSegmentationInstance(): Promise<any> {
  * Fallback background remover using perimeter color sampling and flood-fill alpha matting
  * in case a mobile browser blocks WebGL/WASM.
  */
-function removeBackgroundFallback(sourceImage: HTMLImageElement): HTMLCanvasElement {
-  const w = sourceImage.naturalWidth || sourceImage.width;
-  const h = sourceImage.naturalHeight || sourceImage.height;
+function removeBackgroundFallback(inputCanvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = inputCanvas.width;
+  const h = inputCanvas.height;
 
   const canvas = document.createElement("canvas");
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(sourceImage, 0, 0, w, h);
+  ctx.drawImage(inputCanvas, 0, 0, w, h);
 
   const imgData = ctx.getImageData(0, 0, w, h);
   const data = imgData.data;
 
-  // Sample perimeter pixels along top, left, and right edges to estimate background colors
   const samplePoints: Array<[number, number]> = [
     [2, 2],
     [Math.floor(w * 0.25), 2],
@@ -101,7 +94,8 @@ function removeBackgroundFallback(sourceImage: HTMLImageElement): HTMLCanvasElem
 
   const bgColors: Array<[number, number, number]> = [];
   for (const [sx, sy] of samplePoints) {
-    const idx = (Math.min(h - 1, Math.max(0, sy)) * w + Math.min(w - 1, Math.max(0, sx))) * 4;
+    const idx =
+      (Math.min(h - 1, Math.max(0, sy)) * w + Math.min(w - 1, Math.max(0, sx))) * 4;
     bgColors.push([data[idx], data[idx + 1], data[idx + 2]]);
   }
 
@@ -124,11 +118,9 @@ function removeBackgroundFallback(sourceImage: HTMLImageElement): HTMLCanvasElem
     return minD;
   };
 
-  // Seed flood fill from top, left, and right borders
   for (let x = 0; x < w; x++) {
-    const topIdx = x;
-    visited[topIdx] = 1;
-    queue[tail++] = topIdx;
+    visited[x] = 1;
+    queue[tail++] = x;
   }
   for (let y = 1; y < Math.floor(h * 0.85); y++) {
     const leftIdx = y * w;
@@ -171,7 +163,6 @@ function removeBackgroundFallback(sourceImage: HTMLImageElement): HTMLCanvasElem
     }
   }
 
-  // Apply alpha mask with soft edge transition
   for (let i = 0; i < w * h; i++) {
     if (isBg[i]) {
       data[i * 4 + 3] = 0;
@@ -215,7 +206,6 @@ function trimCutoutBounds(sourceCanvas: HTMLCanvasElement): HTMLCanvasElement {
     return sourceCanvas;
   }
 
-  // Add a small breathing margin around head & shoulders, keep bottom flush with maxY
   const padX = Math.round((maxX - minX) * 0.04);
   const padTop = Math.round((maxY - minY) * 0.03);
 
@@ -235,19 +225,29 @@ function trimCutoutBounds(sourceCanvas: HTMLCanvasElement): HTMLCanvasElement {
 
 /**
  * Removes the background from a visitor's HTMLImageElement and returns a new HTMLImageElement
- * with a transparent background.
+ * with a transparent background. Downscales large phone camera photos first to protect mobile GPU memory.
  */
 export async function removePhotoBackground(
   sourceImage: HTMLImageElement
 ): Promise<HTMLImageElement> {
-  const origW = sourceImage.naturalWidth || sourceImage.width;
-  const origH = sourceImage.naturalHeight || sourceImage.height;
+  const origW = sourceImage.naturalWidth || sourceImage.width || 600;
+  const origH = sourceImage.naturalHeight || sourceImage.height || 800;
 
-  // Cap processing resolution to 1280px max dimension for fast mobile performance
-  const maxDim = 1280;
+  // Cap processing resolution to 960px max dimension so mobile WebGL/Canvas memory stays low
+  const maxDim = 960;
   const scale = origW > maxDim || origH > maxDim ? maxDim / Math.max(origW, origH) : 1;
   const procW = Math.max(1, Math.round(origW * scale));
   const procH = Math.max(1, Math.round(origH * scale));
+
+  // Pre-downscale onto a lightweight canvas before sending to WebGL
+  const inputCanvas = document.createElement("canvas");
+  inputCanvas.width = procW;
+  inputCanvas.height = procH;
+  const inputCtx = inputCanvas.getContext("2d");
+  if (!inputCtx) {
+    return sourceImage;
+  }
+  inputCtx.drawImage(sourceImage, 0, 0, procW, procH);
 
   let resultCanvas: HTMLCanvasElement;
 
@@ -257,7 +257,7 @@ export async function removePhotoBackground(
     resultCanvas = await new Promise<HTMLCanvasElement>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         reject(new Error("Segmentation timed out"));
-      }, 12000);
+      }, 10000);
 
       segmenter.onResults((results: any) => {
         clearTimeout(timeoutId);
@@ -270,14 +270,12 @@ export async function removePhotoBackground(
           ctx.save();
           ctx.clearRect(0, 0, procW, procH);
 
-          // 1. Draw the neural segmentation mask with a slight 1.5px feather for smooth portrait edges
-          ctx.filter = "blur(1.5px)";
+          // Draw the neural segmentation mask
           ctx.drawImage(results.segmentationMask, 0, 0, procW, procH);
-          ctx.filter = "none";
 
-          // 2. Keep only the foreground person where the mask is opaque
+          // Keep only the foreground person where the mask is opaque
           ctx.globalCompositeOperation = "source-in";
-          ctx.drawImage(sourceImage, 0, 0, procW, procH);
+          ctx.drawImage(inputCanvas, 0, 0, procW, procH);
           ctx.restore();
 
           resolve(trimCutoutBounds(outCanvas));
@@ -286,11 +284,10 @@ export async function removePhotoBackground(
         }
       });
 
-      segmenter.send({ image: sourceImage }).catch(reject);
+      segmenter.send({ image: inputCanvas }).catch(reject);
     });
   } catch {
-    // Fallback if WASM/WebGL segmentation fails
-    const fallbackCanvas = removeBackgroundFallback(sourceImage);
+    const fallbackCanvas = removeBackgroundFallback(inputCanvas);
     resultCanvas = trimCutoutBounds(fallbackCanvas);
   }
 
@@ -302,4 +299,3 @@ export async function removePhotoBackground(
     cutoutImg.src = dataUrl;
   });
 }
-

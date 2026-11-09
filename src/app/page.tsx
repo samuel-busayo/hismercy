@@ -31,11 +31,16 @@ import {
   Camera,
   Wand2,
   Layers,
+  Type,
+  Minus,
+  Plus,
 } from "lucide-react";
 import { EVENT_DATA } from "@/data/eventData";
 import {
   MASTER_WIDTH,
   MASTER_HEIGHT,
+  PREVIEW_WIDTH,
+  PREVIEW_HEIGHT,
   PhotoAdjustments,
   DEFAULT_ADJUSTMENTS,
   renderPersonalisedPoster,
@@ -45,6 +50,7 @@ import { removePhotoBackground } from "@/lib/backgroundRemover";
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_NAME_LENGTH = 40;
+const MAX_LOCATION_LENGTH = 42;
 
 export default function HarvestPosterApp() {
   // Master flyer image loaded once in browser memory
@@ -60,13 +66,13 @@ export default function HarvestPosterApp() {
   const [photoPreviewUrl, setPhotoPreviewUrl] = useState<string | null>(null);
   const [photoFileName, setPhotoFileName] = useState<string>("");
   const [visitorName, setVisitorName] = useState<string>("");
+  const [visitorLocation, setVisitorLocation] = useState<string>("");
   const [adjustments, setAdjustments] = useState<PhotoAdjustments>(DEFAULT_ADJUSTMENTS);
 
   // Active photo to render on the poster (cutout when enabled & available, otherwise original)
   const activeVisitorPhoto = useCutout && cutoutPhoto ? cutoutPhoto : originalPhoto;
 
-  // Mobile-friendly view mode for the live preview:
-  // true magnifies the bottom personalised section (including pop-out headroom above the border)
+  // Mobile-friendly view mode for the live preview
   const [focusBottomPanel, setFocusBottomPanel] = useState<boolean>(false);
 
   // Validation & feedback messages
@@ -130,7 +136,7 @@ export default function HarvestPosterApp() {
   // Clean up temporary object URLs on unmount
   useEffect(() => {
     return () => {
-      if (photoPreviewUrl) {
+      if (photoPreviewUrl && photoPreviewUrl.startsWith("blob:")) {
         URL.revokeObjectURL(photoPreviewUrl);
       }
     };
@@ -144,20 +150,36 @@ export default function HarvestPosterApp() {
     };
   }, [generatedPngUrl]);
 
-  // 2. Re-render the live editor canvas whenever masterImage, activeVisitorPhoto, visitorName, or adjustments change
+  // 2. Re-render the live editor canvas throttled via requestAnimationFrame at lightweight PREVIEW_WIDTH x PREVIEW_HEIGHT
+  //    so mobile touch-dragging and slider adjustments never overwhelm mobile GPU/memory or crash the browser
   useEffect(() => {
     const canvas = liveCanvasRef.current;
     if (!canvas || !masterImage) return;
 
-    renderPersonalisedPoster(
-      canvas,
-      masterImage,
-      activeVisitorPhoto,
-      visitorName,
-      adjustments,
-      { showPhotoPlaceholderHint: !activeVisitorPhoto }
-    );
-  }, [masterImage, activeVisitorPhoto, visitorName, adjustments]);
+    const rafId = window.requestAnimationFrame(() => {
+      try {
+        renderPersonalisedPoster(
+          canvas,
+          masterImage,
+          activeVisitorPhoto,
+          visitorName,
+          adjustments,
+          {
+            showPhotoPlaceholderHint: !activeVisitorPhoto,
+            visitorLocation,
+            targetWidth: PREVIEW_WIDTH,
+            targetHeight: PREVIEW_HEIGHT,
+          }
+        );
+      } catch {
+        // Safeguard against transient canvas context errors on mobile browsers
+      }
+    });
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [masterImage, activeVisitorPhoto, visitorName, visitorLocation, adjustments]);
 
   // 3. Handle visitor photograph selection, validation & automatic AI background removal
   const processSelectedFile = useCallback(
@@ -165,7 +187,6 @@ export default function HarvestPosterApp() {
       setUploadError(null);
       setFormError(null);
 
-      // Validate file type (JPG/JPEG, PNG, WebP)
       const normalizedType = file.type.toLowerCase();
       const hasValidExt = /\.(jpe?g|png|webp)$/i.test(file.name);
       if (!ALLOWED_MIME_TYPES.includes(normalizedType) && !hasValidExt) {
@@ -175,7 +196,6 @@ export default function HarvestPosterApp() {
         return;
       }
 
-      // Validate file size (max 10 MB)
       if (file.size > MAX_FILE_SIZE_BYTES) {
         const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
         setUploadError(
@@ -187,7 +207,7 @@ export default function HarvestPosterApp() {
       const objectUrl = URL.createObjectURL(file);
       const img = new Image();
       img.onload = async () => {
-        if (photoPreviewUrl) {
+        if (photoPreviewUrl && photoPreviewUrl.startsWith("blob:")) {
           URL.revokeObjectURL(photoPreviewUrl);
         }
         setPhotoPreviewUrl(objectUrl);
@@ -195,16 +215,18 @@ export default function HarvestPosterApp() {
         setCutoutPhoto(null);
         setUseCutout(true);
         setPhotoFileName(file.name);
-        setAdjustments(DEFAULT_ADJUSTMENTS);
+        setAdjustments((prev) => ({
+          ...DEFAULT_ADJUSTMENTS,
+          nameScale: prev.nameScale,
+          locationScale: prev.locationScale,
+        }));
         setGeneratedPngUrl(null);
         setGeneratedBlob(null);
 
-        // On mobile screens (<768px), automatically zoom in on the bottom panel when a photo is added
         if (typeof window !== "undefined" && window.innerWidth < 768) {
           setFocusBottomPanel(true);
         }
 
-        // Automatically remove background in browser so the cutout pops out like the sample
         setIsRemovingBg(true);
         try {
           const removedBgImg = await removePhotoBackground(img);
@@ -268,7 +290,7 @@ export default function HarvestPosterApp() {
     }
   };
 
-  // 4. Handle name input with character filtering & length cap (Section 4.3)
+  // 4. Handle Name & Location/Parish inputs
   const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.value;
     const sanitized = raw.replace(/[^\p{L}\p{M}\s.'-]/gu, "").slice(0, MAX_NAME_LENGTH);
@@ -280,7 +302,18 @@ export default function HarvestPosterApp() {
     setGeneratedBlob(null);
   };
 
-  // 5. Image adjustment controls (Section 4.2)
+  const handleLocationChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    // Allow letters, numbers, spaces, commas, dots, hyphens, apostrophes, and parentheses
+    const sanitized = raw
+      .replace(/[^\p{L}\p{M}\p{N}\s.,'()-]/gu, "")
+      .slice(0, MAX_LOCATION_LENGTH);
+    setVisitorLocation(sanitized);
+    setGeneratedPngUrl(null);
+    setGeneratedBlob(null);
+  };
+
+  // 5. Image & Text Size adjustment controls
   const adjustZoom = (delta: number) => {
     setAdjustments((prev) => ({
       ...prev,
@@ -298,6 +331,24 @@ export default function HarvestPosterApp() {
     setGeneratedPngUrl(null);
   };
 
+  const adjustNameScale = (delta: number) => {
+    setAdjustments((prev) => ({
+      ...prev,
+      nameScale: Number(Math.max(0.5, Math.min(1.3, prev.nameScale + delta)).toFixed(2)),
+    }));
+    setGeneratedPngUrl(null);
+  };
+
+  const adjustLocationScale = (delta: number) => {
+    setAdjustments((prev) => ({
+      ...prev,
+      locationScale: Number(
+        Math.max(0.5, Math.min(1.3, prev.locationScale + delta)).toFixed(2)
+      ),
+    }));
+    setGeneratedPngUrl(null);
+  };
+
   const toggleOverflowMode = () => {
     setAdjustments((prev) => ({
       ...prev,
@@ -311,10 +362,14 @@ export default function HarvestPosterApp() {
     setGeneratedPngUrl(null);
   };
 
-  // Pointer drag support directly on the preview canvas
+  // Crash-safe pointer drag handlers for mobile touch & desktop mouse
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!activeVisitorPhoto) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture is unsupported on target mobile browser
+    }
     setIsDraggingPhoto(true);
     dragStartRef.current = {
       x: e.clientX,
@@ -325,27 +380,46 @@ export default function HarvestPosterApp() {
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isDraggingPhoto || !dragStartRef.current) return;
-    const dx = e.clientX - dragStartRef.current.x;
-    const dy = e.clientY - dragStartRef.current.y;
+    const dragStart = dragStartRef.current;
+    if (!isDraggingPhoto || !dragStart) return;
+
+    const dx = e.clientX - dragStart.x;
+    const dy = e.clientY - dragStart.y;
     const sensitivity = focusBottomPanel ? 0.32 : 0.52;
-    setAdjustments((prev) => ({
-      ...prev,
-      offsetX: Math.round(
-        Math.max(-100, Math.min(100, dragStartRef.current!.startOffsetX + dx * sensitivity))
-      ),
-      offsetY: Math.round(
-        Math.max(-100, Math.min(100, dragStartRef.current!.startOffsetY + dy * sensitivity))
-      ),
-    }));
+
+    // Compute values BEFORE calling setAdjustments so dragStartRef is never read asynchronously after nulling
+    const nextOffsetX = Math.round(
+      Math.max(-100, Math.min(100, dragStart.startOffsetX + dx * sensitivity))
+    );
+    const nextOffsetY = Math.round(
+      Math.max(-100, Math.min(100, dragStart.startOffsetY + dy * sensitivity))
+    );
+
+    setAdjustments((prev) => {
+      if (prev.offsetX === nextOffsetX && prev.offsetY === nextOffsetY) {
+        return prev;
+      }
+      return {
+        ...prev,
+        offsetX: nextOffsetX,
+        offsetY: nextOffsetY,
+      };
+    });
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore
+    }
     setIsDraggingPhoto(false);
     dragStartRef.current = null;
   };
 
-  // 6. Generate final high-resolution poster on a dedicated working canvas (Section 6.1)
+  // 6. Generate final high-resolution poster on a dedicated working canvas (1489 x 2047)
   const handleGeneratePoster = async () => {
     setFormError(null);
     setShareStatusMessage(null);
@@ -387,7 +461,12 @@ export default function HarvestPosterApp() {
         activeVisitorPhoto,
         visitorName.trim(),
         adjustments,
-        { showPhotoPlaceholderHint: false }
+        {
+          showPhotoPlaceholderHint: false,
+          visitorLocation,
+          targetWidth: MASTER_WIDTH,
+          targetHeight: MASTER_HEIGHT,
+        }
       );
 
       workingCanvas.toBlob(
@@ -523,6 +602,7 @@ export default function HarvestPosterApp() {
     setPhotoPreviewUrl(null);
     setPhotoFileName("");
     setVisitorName("");
+    setVisitorLocation("");
     setAdjustments(DEFAULT_ADJUSTMENTS);
     setGeneratedPngUrl(null);
     setGeneratedBlob(null);
@@ -641,10 +721,10 @@ export default function HarvestPosterApp() {
                   </div>
                   <div className="bg-black/25 rounded-xl p-2.5 sm:p-3 border border-white/10">
                     <span className="text-[10px] sm:text-xs font-bold uppercase text-[#f5b82e]">
-                      2. Name
+                      2. Details
                     </span>
                     <p className="text-xs sm:text-sm font-semibold text-white mt-0.5 leading-snug">
-                      Type your name
+                      Name &amp; Location/Parish
                     </p>
                   </div>
                   <div className="bg-black/25 rounded-xl p-2.5 sm:p-3 border border-white/10">
@@ -702,8 +782,8 @@ export default function HarvestPosterApp() {
                 CREATE YOUR &ldquo;I WILL BE THERE&rdquo; POSTER
               </h2>
               <p className="text-xs sm:text-base text-[#5a2230]">
-                Upload your picture (background is removed automatically!), enter your name, and
-                position your cutout freely.
+                Upload your picture, enter your name and location or parish, and adjust your
+                cutout and text size.
               </p>
             </div>
 
@@ -715,7 +795,7 @@ export default function HarvestPosterApp() {
             )}
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 lg:gap-x-10 lg:gap-y-6 items-start">
-              {/* BLOCK A (Step 1 Photo + Background Removal + Step 2 Name): Top-Left on Desktop, 1st on Mobile */}
+              {/* BLOCK A (Step 1 Photo + Step 2 Name & Location/Parish): Top-Left on Desktop, 1st on Mobile */}
               <div className="lg:col-span-6 space-y-5 bg-[#f7f1e1] p-4 sm:p-6 rounded-2xl border-2 border-[#e5dcc8] shadow-sm">
                 {/* STEP 1: PHOTOGRAPH UPLOAD & AI BACKGROUND REMOVAL */}
                 <div className="space-y-3">
@@ -814,7 +894,7 @@ export default function HarvestPosterApp() {
                     )}
                   </div>
 
-                  {/* Background Removal Toggle Bar (Visible once a photo is selected) */}
+                  {/* Background Removal Toggle Bar */}
                   {originalPhoto && (
                     <div className="flex flex-wrap items-center justify-between gap-2 bg-[#fdfaf2] px-3.5 py-2.5 rounded-xl border border-[#e5dcc8]">
                       <div className="flex items-center gap-2 text-xs font-bold text-[#3d0613]">
@@ -851,55 +931,103 @@ export default function HarvestPosterApp() {
                   )}
                 </div>
 
-                {/* STEP 2: NAME INPUT */}
-                <div className="space-y-2 pt-3 border-t border-[#e5dcc8]">
-                  <div className="flex items-center justify-between">
-                    <label
-                      htmlFor="visitor-name-input"
-                      className="flex items-center gap-2 text-sm sm:text-base font-extrabold text-[#3d0613]"
-                    >
-                      <span className="w-6 h-6 rounded-full bg-[#680d22] text-[#f5b82e] text-xs flex items-center justify-center font-bold shrink-0">
-                        2
+                {/* STEP 2: NAME & LOCATION / PARISH INPUTS */}
+                <div className="space-y-3.5 pt-3 border-t border-[#e5dcc8]">
+                  {/* Visitor Name Field */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <label
+                        htmlFor="visitor-name-input"
+                        className="flex items-center gap-2 text-sm sm:text-base font-extrabold text-[#3d0613]"
+                      >
+                        <span className="w-6 h-6 rounded-full bg-[#680d22] text-[#f5b82e] text-xs flex items-center justify-center font-bold shrink-0">
+                          2
+                        </span>
+                        <span>Enter Your Name</span>
+                        <span className="text-red-600">*</span>
+                      </label>
+                      <span className="text-xs font-semibold text-[#5a2230]">
+                        {visitorName.length}/{MAX_NAME_LENGTH}
                       </span>
-                      <span>Enter Your Name</span>
-                      <span className="text-red-600">*</span>
-                    </label>
-                    <span className="text-xs font-semibold text-[#5a2230]">
-                      {visitorName.length}/{MAX_NAME_LENGTH}
-                    </span>
+                    </div>
+
+                    <div className="relative">
+                      <User className="w-5 h-5 text-[#680d22]/60 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        id="visitor-name-input"
+                        type="text"
+                        required
+                        enterKeyHint="next"
+                        autoComplete="name"
+                        value={visitorName}
+                        onChange={handleNameChange}
+                        placeholder="e.g. Bro. Adewale Ogunleye"
+                        maxLength={MAX_NAME_LENGTH}
+                        className="w-full pl-11 pr-10 py-3 rounded-xl bg-[#fdfaf2] border-2 border-[#d5c9b1] focus:border-[#680d22] focus:outline-none text-base font-bold text-[#220910] placeholder:font-normal placeholder:text-[#846b72]"
+                      />
+                      {visitorName && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setVisitorName("");
+                            setGeneratedPngUrl(null);
+                          }}
+                          aria-label="Clear name"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-[#680d22]/70 hover:bg-[#e5dcc8]/50"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="relative">
-                    <User className="w-5 h-5 text-[#680d22]/60 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                    <input
-                      id="visitor-name-input"
-                      type="text"
-                      required
-                      enterKeyHint="done"
-                      autoComplete="name"
-                      value={visitorName}
-                      onChange={handleNameChange}
-                      placeholder="e.g. Bro. Adewale Ogunleye"
-                      maxLength={MAX_NAME_LENGTH}
-                      className="w-full pl-11 pr-10 py-3.5 rounded-xl bg-[#fdfaf2] border-2 border-[#d5c9b1] focus:border-[#680d22] focus:outline-none text-base font-bold text-[#220910] placeholder:font-normal placeholder:text-[#846b72]"
-                    />
-                    {visitorName && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setVisitorName("");
-                          setGeneratedPngUrl(null);
-                        }}
-                        aria-label="Clear name"
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-[#680d22]/70 hover:bg-[#e5dcc8]/50"
+                  {/* Location (City) or Parish Field */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <label
+                        htmlFor="visitor-location-input"
+                        className="flex items-center gap-2 text-xs sm:text-sm font-extrabold text-[#3d0613]"
                       >
-                        <X className="w-4 h-4" />
-                      </button>
-                    )}
+                        <MapPin className="w-4 h-4 text-[#680d22] shrink-0" />
+                        <span>Location (e.g. City) or Parish</span>
+                        <span className="text-[11px] font-normal text-[#5a2230]">(Optional)</span>
+                      </label>
+                      <span className="text-xs font-semibold text-[#5a2230]">
+                        {visitorLocation.length}/{MAX_LOCATION_LENGTH}
+                      </span>
+                    </div>
+
+                    <div className="relative">
+                      <MapPin className="w-5 h-5 text-[#680d22]/60 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        id="visitor-location-input"
+                        type="text"
+                        enterKeyHint="done"
+                        value={visitorLocation}
+                        onChange={handleLocationChange}
+                        placeholder="e.g. Lagos, or His Mercy Parish"
+                        maxLength={MAX_LOCATION_LENGTH}
+                        className="w-full pl-11 pr-10 py-3 rounded-xl bg-[#fdfaf2] border-2 border-[#d5c9b1] focus:border-[#680d22] focus:outline-none text-base font-bold text-[#220910] placeholder:font-normal placeholder:text-[#846b72]"
+                      />
+                      {visitorLocation && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setVisitorLocation("");
+                            setGeneratedPngUrl(null);
+                          }}
+                          aria-label="Clear location or parish"
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-[#680d22]/70 hover:bg-[#e5dcc8]/50"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-[#5a2230]">
+                      Appears in brackets underneath your name — e.g.{" "}
+                      <strong>({visitorLocation.trim() || "Location Or Parish"})</strong>
+                    </p>
                   </div>
-                  <p className="text-[11px] sm:text-xs text-[#5a2230]">
-                    Replaces &ldquo;USER NAME&rdquo; on the flyer and automatically scales to fit.
-                  </p>
                 </div>
               </div>
 
@@ -936,7 +1064,6 @@ export default function HarvestPosterApp() {
                   </div>
 
                   <div className="rounded-2xl p-2 bg-gradient-to-b from-[#680d22] to-[#3d0613] shadow-xl border-2 border-[#f5b82e]/70">
-                    {/* When focusBottomPanel is true, we show the bottom 38% of the flyer so the user clearly sees their head popping out above the cream panel border */}
                     <div
                       className={`rounded-xl overflow-hidden bg-[#3d0613] relative transition-all duration-300 ${
                         focusBottomPanel ? "aspect-[1489/760]" : ""
@@ -944,8 +1071,8 @@ export default function HarvestPosterApp() {
                     >
                       <canvas
                         ref={liveCanvasRef}
-                        width={MASTER_WIDTH}
-                        height={MASTER_HEIGHT}
+                        width={PREVIEW_WIDTH}
+                        height={PREVIEW_HEIGHT}
                         onPointerDown={handlePointerDown}
                         onPointerMove={handlePointerMove}
                         onPointerUp={handlePointerUp}
@@ -961,7 +1088,7 @@ export default function HarvestPosterApp() {
                     <div className="mt-1.5 px-2 flex items-center justify-between text-[11px] text-[#f7f1e1]/90">
                       <span>
                         {activeVisitorPhoto
-                          ? "Drag your cutout with your finger or use controls below"
+                          ? "Drag your photo with your finger or use controls below"
                           : "Upload a photo above to preview"}
                       </span>
                       <button
@@ -976,33 +1103,126 @@ export default function HarvestPosterApp() {
                 </div>
               </div>
 
-              {/* BLOCK C (Step 3 Adjust Photo + Pop-Out Border Toggle + Step 4 Generate Button): Bottom-Left on Desktop, 3rd on Mobile */}
+              {/* BLOCK C (Step 3 Photo & Text Size Adjustments + Step 4 Generate Button): Bottom-Left on Desktop, 3rd on Mobile */}
               <div className="lg:col-span-6 lg:col-start-1 lg:row-start-2 space-y-5 bg-[#f7f1e1] p-4 sm:p-6 rounded-2xl border-2 border-[#e5dcc8] shadow-sm">
-                {/* STEP 3: PHOTO POSITIONING, POP-OUT BORDER MODE & ZOOM CONTROLS */}
+                {/* STEP 3: PHOTO POSITION, POP-OUT BORDER & TEXT SIZE CONTROLS */}
                 <div className="space-y-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 text-sm sm:text-base font-extrabold text-[#3d0613]">
                       <span className="w-6 h-6 rounded-full bg-[#680d22] text-[#f5b82e] text-xs flex items-center justify-center font-bold shrink-0">
                         3
                       </span>
-                      <span>Adjust Position &amp; Border Overflow</span>
+                      <span>Adjust Photo &amp; Text Size</span>
                     </div>
                     <button
                       type="button"
                       onClick={resetAdjustments}
-                      disabled={!activeVisitorPhoto}
-                      className="inline-flex items-center gap-1 text-xs font-bold text-[#680d22] hover:text-[#3d0613] disabled:opacity-40 cursor-pointer px-2.5 py-1.5 rounded-lg bg-[#fdfaf2] border border-[#d5c9b1]"
+                      className="inline-flex items-center gap-1 text-xs font-bold text-[#680d22] hover:text-[#3d0613] cursor-pointer px-2.5 py-1.5 rounded-lg bg-[#fdfaf2] border border-[#d5c9b1]"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
-                      <span>Reset</span>
+                      <span>Reset All</span>
                     </button>
+                  </div>
+
+                  {/* TEXT SIZE CONTROLS (Name Size & Location/Parish Size) */}
+                  <div className="bg-[#fdfaf2] p-3.5 sm:p-4 rounded-xl border border-[#e5dcc8] space-y-3">
+                    <div className="flex items-center gap-1.5 text-xs font-extrabold uppercase tracking-wider text-[#680d22]">
+                      <Type className="w-4 h-4 shrink-0" />
+                      <span>Name &amp; Location Text Size</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                      {/* Name Text Size Control */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs font-bold text-[#3d0613]">
+                          <span>Name Size: {Math.round(adjustments.nameScale * 100)}%</span>
+                          <div className="flex gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => adjustNameScale(-0.08)}
+                              aria-label="Reduce name text size"
+                              className="min-w-[38px] min-h-[34px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
+                            >
+                              <Minus className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => adjustNameScale(0.08)}
+                              aria-label="Increase name text size"
+                              className="min-w-[38px] min-h-[34px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={1.3}
+                          step={0.02}
+                          value={adjustments.nameScale}
+                          onChange={(e) => {
+                            setAdjustments((prev) => ({
+                              ...prev,
+                              nameScale: parseFloat(e.target.value),
+                            }));
+                            setGeneratedPngUrl(null);
+                          }}
+                          aria-label="Name text size"
+                          className="w-full"
+                        />
+                      </div>
+
+                      {/* Location / Parish Text Size Control */}
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs font-bold text-[#3d0613]">
+                          <span>
+                            Location Size: {Math.round(adjustments.locationScale * 100)}%
+                          </span>
+                          <div className="flex gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => adjustLocationScale(-0.08)}
+                              aria-label="Reduce location text size"
+                              className="min-w-[38px] min-h-[34px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
+                            >
+                              <Minus className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => adjustLocationScale(0.08)}
+                              aria-label="Increase location text size"
+                              className="min-w-[38px] min-h-[34px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.5}
+                          max={1.3}
+                          step={0.02}
+                          value={adjustments.locationScale}
+                          onChange={(e) => {
+                            setAdjustments((prev) => ({
+                              ...prev,
+                              locationScale: parseFloat(e.target.value),
+                            }));
+                            setGeneratedPngUrl(null);
+                          }}
+                          aria-label="Location or parish text size"
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
                   </div>
 
                   {/* Allow Beyond Border (Pop-Out Mode) Toggle */}
                   <div className="flex items-center justify-between gap-2 bg-[#fdfaf2] px-3.5 py-2.5 rounded-xl border border-[#e5dcc8]">
                     <div className="flex items-center gap-2 text-xs font-bold text-[#3d0613]">
                       <Layers className="w-4 h-4 text-[#680d22] shrink-0" />
-                      <span>Extend Beyond Panel Border (Pop-Out):</span>
+                      <span>Extend Photo Beyond Border:</span>
                     </div>
                     <button
                       type="button"
@@ -1020,11 +1240,11 @@ export default function HarvestPosterApp() {
                     </button>
                   </div>
 
+                  {/* PHOTO ZOOM & DIRECTIONAL CONTROLS */}
                   <div className="bg-[#fdfaf2] p-3.5 sm:p-4 rounded-xl border border-[#e5dcc8] space-y-3.5">
-                    {/* Zoom Row with Large Touch Buttons */}
                     <div className="space-y-2">
                       <div className="flex items-center justify-between text-xs font-bold text-[#3d0613]">
-                        <span>Zoom Level: {Math.round(adjustments.zoom * 100)}%</span>
+                        <span>Photo Zoom: {Math.round(adjustments.zoom * 100)}%</span>
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -1074,7 +1294,7 @@ export default function HarvestPosterApp() {
                           <div className="flex gap-1.5">
                             <button
                               type="button"
-                              onClick={() => adjustPan(-8, 0)}
+                              onClick={() => adjustPan(-6, 0)}
                               disabled={!activeVisitorPhoto}
                               aria-label="Move photo left"
                               className="min-w-[42px] min-h-[36px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] disabled:opacity-40 flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
@@ -1083,7 +1303,7 @@ export default function HarvestPosterApp() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => adjustPan(8, 0)}
+                              onClick={() => adjustPan(6, 0)}
                               disabled={!activeVisitorPhoto}
                               aria-label="Move photo right"
                               className="min-w-[42px] min-h-[36px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] disabled:opacity-40 flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
@@ -1117,7 +1337,7 @@ export default function HarvestPosterApp() {
                           <div className="flex gap-1.5">
                             <button
                               type="button"
-                              onClick={() => adjustPan(0, -8)}
+                              onClick={() => adjustPan(0, -6)}
                               disabled={!activeVisitorPhoto}
                               aria-label="Move photo up"
                               className="min-w-[42px] min-h-[36px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] disabled:opacity-40 flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
@@ -1126,7 +1346,7 @@ export default function HarvestPosterApp() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => adjustPan(0, 8)}
+                              onClick={() => adjustPan(0, 6)}
                               disabled={!activeVisitorPhoto}
                               aria-label="Move photo down"
                               className="min-w-[42px] min-h-[36px] rounded-lg bg-[#f7f1e1] hover:bg-[#e5dcc8] active:bg-[#d5c9b1] text-[#3d0613] disabled:opacity-40 flex items-center justify-center cursor-pointer border border-[#d5c9b1]"
@@ -1244,7 +1464,6 @@ export default function HarvestPosterApp() {
                   </p>
 
                   <div className="space-y-3 pt-1">
-                    {/* Primary Download PNG Button */}
                     <button
                       type="button"
                       onClick={handleDownloadPoster}
@@ -1254,7 +1473,6 @@ export default function HarvestPosterApp() {
                       <span>Download Poster (PNG)</span>
                     </button>
 
-                    {/* Share via WhatsApp Button */}
                     <button
                       type="button"
                       onClick={handleWhatsAppShare}
@@ -1264,7 +1482,6 @@ export default function HarvestPosterApp() {
                       <span>Share on WhatsApp</span>
                     </button>
 
-                    {/* Native Web Share Button */}
                     <button
                       type="button"
                       onClick={handleSharePoster}
@@ -1281,7 +1498,6 @@ export default function HarvestPosterApp() {
                     </div>
                   )}
 
-                  {/* Clear Fallback Instructions when browser does not auto-attach files to WhatsApp */}
                   {showWhatsappFallbackNote && (
                     <div className="p-3.5 rounded-xl bg-black/40 border border-[#f5b82e]/50 space-y-2 text-xs sm:text-sm text-[#f7f1e1]">
                       <p className="font-bold text-[#f5b82e]">
@@ -1312,7 +1528,6 @@ export default function HarvestPosterApp() {
                     </div>
                   )}
 
-                  {/* Return to Editing & Create Another Poster */}
                   <div className="pt-3 border-t border-white/15 grid grid-cols-2 gap-2.5">
                     <button
                       type="button"
@@ -1359,7 +1574,6 @@ export default function HarvestPosterApp() {
               </p>
             </div>
 
-            {/* Two Main Programmes */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
               {EVENT_DATA.programmes.map((prog, index) => (
                 <div
@@ -1406,7 +1620,6 @@ export default function HarvestPosterApp() {
               ))}
             </div>
 
-            {/* Venue Address, Contact & Guest Ministers */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 bg-[#480816] text-[#fdfaf2] rounded-2xl p-5 sm:p-8 shadow-md border border-[#f5b82e]/30">
               <div className="lg:col-span-5 space-y-3.5 border-b lg:border-b-0 lg:border-r border-white/15 pb-5 lg:pb-0 lg:pr-6">
                 <h3 className="text-base sm:text-lg font-bold text-[#f5b82e] uppercase tracking-wider">
